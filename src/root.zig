@@ -17,6 +17,17 @@ pub fn add(a: i32, b: i32) i32 {
     return a + b;
 }
 
+export fn Java_com_example_flock_MainActivity_add(
+    env: ?*anyopaque, // JNIEnv* - nullable in case of issues
+    obj: ?*anyopaque, // jobject - the 'this' reference
+    a: i32,
+    b: i32,
+) callconv(.c) i32 {
+    _ = env; // Unused for this simple example
+    _ = obj; // Unused for this simple example
+    return add(a, b); // Delegate to your internal function
+}
+
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
 }

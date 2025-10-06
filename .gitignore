@@ -1,0 +1,13 @@
+# Zig build artifacts and cache
+zig-out/
+.zig-cache/
+
+# Operating System generated files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo

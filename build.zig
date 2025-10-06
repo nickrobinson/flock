@@ -1,33 +1,82 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
-    .{ .cpu_arch = .aarch64, .os_tag = .linux },
+    .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .android },
     .{ .cpu_arch = .x86_64, .os_tag = .windows },
 };
 
 pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
 
+    // Allow override: `zig build -Dandroid-api=29`
+    const android_api: u32 = b.option(u32, "android-api", "Android API level (e.g. 29)") orelse 29;
+
     for (targets) |t| {
+        const resolved = b.resolveTargetQuery(t);
+
         const libflock = b.addLibrary(.{
             .name = "flock",
             .linkage = .dynamic,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/root.zig"),
-                .target = b.resolveTargetQuery(t),
-                .optimize = optimize
+                .target = resolved,
+                .optimize = optimize,
             }),
         });
 
-        const target_output = b.addInstallArtifact(libflock, .{
-            .dest_dir = .{
-                .override = .{
-                    .custom = try t.zigTriple(b.allocator),
-                },
-            },
-        });
+        if (t.abi == .android) {
+            // --- Find the NDK root ---
+            const ndk_dir: []u8 = blk: {
+                if (std.process.hasEnvVarConstant("ANDROID_NDK_HOME"))
+                    break :blk try std.process.getEnvVarOwned(b.allocator, "ANDROID_NDK_HOME");
+                if (std.process.hasEnvVarConstant("ANDROID_NDK_ROOT"))
+                    break :blk try std.process.getEnvVarOwned(b.allocator, "ANDROID_NDK_ROOT");
+                return error.AndroidNdkNotFound;
+            };
 
-        b.getInstallStep().dependOn(&target_output.step);
+            // --- Host prebuilt dir (darwin-arm64 / darwin-x86_64) ---
+            const host_arch = "x86_64";
+            const prebuilt = try std.fmt.allocPrint(b.allocator, "toolchains/llvm/prebuilt/darwin-{s}", .{host_arch});
+            // keep prebuilt alive (no free)
+
+            // --- Android arch triple subdir ---
+            const arch_subdir = switch (resolved.result.cpu.arch) {
+                .aarch64 => "aarch64-linux-android",
+                .arm => "arm-linux-androideabi",
+                .x86 => "i686-linux-android",
+                .x86_64 => "x86_64-linux-android",
+                else => @panic("unsupported Android arch"),
+            };
+
+            const api_s = try std.fmt.allocPrint(b.allocator, "{d}", .{android_api});
+
+            // --- Sysroot include and lib dirs ---
+            const sysroot = b.pathJoin(&.{ ndk_dir, prebuilt, "sysroot" });
+            const include_dir = b.pathJoin(&.{ sysroot, "usr", "include" });
+            const bionic_lib_dir = b.pathJoin(&.{ sysroot, "usr", "lib", arch_subdir, api_s });
+
+            // IMPORTANT: use these; do NOT add ".../sysroot/usr/lib"
+            libflock.root_module.addSystemIncludePath(.{ .cwd_relative = include_dir });
+            libflock.root_module.addLibraryPath(.{ .cwd_relative = bionic_lib_dir });
+
+            const libc_path = b.pathJoin(&.{ bionic_lib_dir, "libc.so" });
+            libflock.addObjectFile(.{ .cwd_relative = libc_path });
+
+            // Link against bionic explicitly; Zig won’t synthesize it.
+            libflock.linkSystemLibrary("log");
+        } else {
+            // Non-Android: let Zig provide libc.
+            libflock.linkLibC();
+        }
+
+        // Install to a stable, arena-owned string (avoid freeing/garbling)
+        const triple_owned = try t.zigTriple(b.allocator);
+        const triple = b.dupe(triple_owned);
+        const out = b.addInstallArtifact(libflock, .{
+            .dest_dir = .{ .override = .{ .custom = triple } },
+        });
+        b.getInstallStep().dependOn(&out.step);
     }
 }

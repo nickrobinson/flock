@@ -25,22 +25,18 @@ pub fn build(b: *std.Build) !void {
             }),
         });
 
-        // Build mdns for ALL platforms, not just Android
-        const mdns_lib = b.addLibrary(.{
-            .name = "mdns",
-            .linkage = .static,
-            .root_module = b.createModule(.{
-                .target = resolved,
-                .optimize = optimize,
-            }),
-        });
+        // Add mdns include path
+        libflock.addIncludePath(b.path("vendor/mdns"));
 
-        mdns_lib.addCSourceFile(.{
-            .file = b.path("src/mdns_wrapper.c"),
-            .flags = &[_][]const u8{"-std=c99"},
+        // IMPORTANT: Actually compile mdns.c!
+        libflock.addCSourceFile(.{
+            .file = b.path("vendor/mdns/mdns.c"),
+            .flags = &.{
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+            },
         });
-
-        mdns_lib.root_module.addIncludePath(b.path("vendor/mdns"));
 
         if (t.abi == .android) {
             // --- Find the NDK root ---
@@ -72,39 +68,35 @@ pub fn build(b: *std.Build) !void {
             const include_dir = b.pathJoin(&.{ sysroot, "usr", "include" });
             const bionic_lib_dir = b.pathJoin(&.{ sysroot, "usr", "lib", arch_subdir, api_s });
 
-            // Android-specific: add architecture-specific include directory
-            const arch_include_dir = b.pathJoin(&.{ sysroot, "usr", "include", arch_subdir });
-
-            // Add NDK headers to mdns for Android
-            mdns_lib.root_module.addSystemIncludePath(.{ .cwd_relative = include_dir });
-            mdns_lib.root_module.addSystemIncludePath(.{ .cwd_relative = arch_include_dir });
-            mdns_lib.root_module.addLibraryPath(.{ .cwd_relative = bionic_lib_dir });
-
             // Add includes to libflock
             libflock.root_module.addSystemIncludePath(.{ .cwd_relative = include_dir });
+
+            // CRITICAL: Add architecture-specific include path for asm headers
+            const arch_include_dir = b.pathJoin(&.{ include_dir, arch_subdir });
+            libflock.root_module.addSystemIncludePath(.{ .cwd_relative = arch_include_dir });
+
+            // Add library path
             libflock.root_module.addLibraryPath(.{ .cwd_relative = bionic_lib_dir });
 
+            // Link against libc.so directly
             const libc_path = b.pathJoin(&.{ bionic_lib_dir, "libc.so" });
             libflock.addObjectFile(.{ .cwd_relative = libc_path });
 
-            // Link against bionic explicitly; Zig won't synthesize it.
+            // Link against Android log library
             libflock.linkSystemLibrary("log");
         } else {
-            // Non-Android: let Zig provide libc for both libflock and mdns
+            // Non-Android: let Zig provide libc
             libflock.linkLibC();
-            mdns_lib.linkLibC();
         }
-
-        // Link mdns to flock for ALL platforms
-        libflock.linkLibrary(mdns_lib);
-        libflock.root_module.addIncludePath(b.path("vendor/mdns"));
 
         // Install to a stable, arena-owned string
         const triple_owned = try t.zigTriple(b.allocator);
         const triple = b.dupe(triple_owned);
+
         const out = b.addInstallArtifact(libflock, .{
             .dest_dir = .{ .override = .{ .custom = triple } },
         });
+
         b.getInstallStep().dependOn(&out.step);
     }
 }

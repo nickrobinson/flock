@@ -4,7 +4,6 @@ const builtin = @import("builtin");
 const targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
     .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .android },
-    .{ .cpu_arch = .x86_64, .os_tag = .windows },
 };
 
 pub fn build(b: *std.Build) !void {
@@ -26,6 +25,23 @@ pub fn build(b: *std.Build) !void {
             }),
         });
 
+        // Build mdns for ALL platforms, not just Android
+        const mdns_lib = b.addLibrary(.{
+            .name = "mdns",
+            .linkage = .static,
+            .root_module = b.createModule(.{
+                .target = resolved,
+                .optimize = optimize,
+            }),
+        });
+
+        mdns_lib.addCSourceFile(.{
+            .file = b.path("src/mdns_wrapper.c"),
+            .flags = &[_][]const u8{"-std=c99"},
+        });
+
+        mdns_lib.root_module.addIncludePath(b.path("vendor/mdns"));
+
         if (t.abi == .android) {
             // --- Find the NDK root ---
             const ndk_dir: []u8 = blk: {
@@ -39,7 +55,6 @@ pub fn build(b: *std.Build) !void {
             // --- Host prebuilt dir (darwin-arm64 / darwin-x86_64) ---
             const host_arch = "x86_64";
             const prebuilt = try std.fmt.allocPrint(b.allocator, "toolchains/llvm/prebuilt/darwin-{s}", .{host_arch});
-            // keep prebuilt alive (no free)
 
             // --- Android arch triple subdir ---
             const arch_subdir = switch (resolved.result.cpu.arch) {
@@ -57,21 +72,34 @@ pub fn build(b: *std.Build) !void {
             const include_dir = b.pathJoin(&.{ sysroot, "usr", "include" });
             const bionic_lib_dir = b.pathJoin(&.{ sysroot, "usr", "lib", arch_subdir, api_s });
 
-            // IMPORTANT: use these; do NOT add ".../sysroot/usr/lib"
+            // Android-specific: add architecture-specific include directory
+            const arch_include_dir = b.pathJoin(&.{ sysroot, "usr", "include", arch_subdir });
+
+            // Add NDK headers to mdns for Android
+            mdns_lib.root_module.addSystemIncludePath(.{ .cwd_relative = include_dir });
+            mdns_lib.root_module.addSystemIncludePath(.{ .cwd_relative = arch_include_dir });
+            mdns_lib.root_module.addLibraryPath(.{ .cwd_relative = bionic_lib_dir });
+
+            // Add includes to libflock
             libflock.root_module.addSystemIncludePath(.{ .cwd_relative = include_dir });
             libflock.root_module.addLibraryPath(.{ .cwd_relative = bionic_lib_dir });
 
             const libc_path = b.pathJoin(&.{ bionic_lib_dir, "libc.so" });
             libflock.addObjectFile(.{ .cwd_relative = libc_path });
 
-            // Link against bionic explicitly; Zig won’t synthesize it.
+            // Link against bionic explicitly; Zig won't synthesize it.
             libflock.linkSystemLibrary("log");
         } else {
-            // Non-Android: let Zig provide libc.
+            // Non-Android: let Zig provide libc for both libflock and mdns
             libflock.linkLibC();
+            mdns_lib.linkLibC();
         }
 
-        // Install to a stable, arena-owned string (avoid freeing/garbling)
+        // Link mdns to flock for ALL platforms
+        libflock.linkLibrary(mdns_lib);
+        libflock.root_module.addIncludePath(b.path("vendor/mdns"));
+
+        // Install to a stable, arena-owned string
         const triple_owned = try t.zigTriple(b.allocator);
         const triple = b.dupe(triple_owned);
         const out = b.addInstallArtifact(libflock, .{

@@ -45,7 +45,7 @@ int mdns_wrapper_send_discovery(int sock) {
     uint8_t query_buffer[1024];
     
     // Build the query using mdns_query_send
-    const char* service = "_services._dns-sd._udp.local";
+    const char* service = "_http-alt._tcp.local";
     
     // mdns_query_send returns the size of the query built
     size_t query_size = mdns_query_send(sock, MDNS_RECORDTYPE_PTR,

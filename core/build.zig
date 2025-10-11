@@ -35,6 +35,9 @@ pub fn build(b: *std.Build) !void {
                 "-std=c11",
                 "-Wall",
                 "-Wextra",
+                // Add flags to ensure proper alignment on ARM64
+                "-fno-strict-aliasing",
+                "-falign-functions=4",
             },
         });
 

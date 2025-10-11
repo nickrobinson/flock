@@ -95,11 +95,13 @@ pub fn closeMdnsSocket(sock: i32) void {
 
 // Helper to send discovery query
 pub fn sendMdnsDiscovery(sock: i32) i32 {
-    var buffer: [2048]u8 = undefined;
+    // Buffer must be aligned for mdns_query_send - use align(@alignOf(u32)) for 32-bit alignment
+    var buffer: [2048]u8 align(@alignOf(u32)) = undefined;
     const query_type: u16 = mdns.MDNS_RECORDTYPE_PTR;
-    const service = "_http-alt._tcp.local.";
+    const service = "_services._dns-sd._udp.local.";
 
-    const query_id = mdns.mdns_query_send(sock, query_type, service.ptr, service.len, &buffer, buffer.len, 0);
+    const buffer_ptr = @as(*anyopaque, @ptrCast(&buffer));
+    const query_id = mdns.mdns_query_send(sock, query_type, service.ptr, service.len, buffer_ptr, buffer.len, 0);
 
     return query_id;
 }
@@ -149,8 +151,10 @@ fn discoveryCallback(sock: c_int, from: [*c]const mdns.struct_sockaddr, addrlen:
     _ = ttl;
     _ = name_offset;
     _ = name_length;
-
-    const session_ptr = @as(*DiscoverySession, @ptrCast(@alignCast(user_data.?)));
+    _ = user_data;
+    
+    // Since we're using the global session, we can just use that directly
+    const session = current_session orelse return 0;
 
     if (entry == mdns.MDNS_ENTRYTYPE_ANSWER and rtype == mdns.MDNS_RECORDTYPE_PTR) {
         // Parse PTR record to get service name
@@ -159,11 +163,11 @@ fn discoveryCallback(sock: c_int, from: [*c]const mdns.struct_sockaddr, addrlen:
 
         if (parsed_name.length > 0) {
             // Create device entry - add null termination for C string compatibility
-            const device_name = session_ptr.allocator.allocSentinel(u8, parsed_name.length, 0) catch return 0;
+            const device_name = session.allocator.allocSentinel(u8, parsed_name.length, 0) catch return 0;
             @memcpy(device_name[0..parsed_name.length], parsed_name.str[0..parsed_name.length]);
 
-            const device_ip = session_ptr.allocator.allocSentinel(u8, 7, 0) catch {
-                session_ptr.allocator.free(device_name);
+            const device_ip = session.allocator.allocSentinel(u8, 7, 0) catch {
+                session.allocator.free(device_name);
                 return 0;
             };
             @memcpy(device_ip[0..7], "unknown");
@@ -174,7 +178,7 @@ fn discoveryCallback(sock: c_int, from: [*c]const mdns.struct_sockaddr, addrlen:
                 .port = 0,
             };
 
-            session_ptr.devices.append(session_ptr.allocator, device) catch return 0;
+            session.devices.append(session.allocator, device) catch return 0;
         }
     }
 
@@ -187,7 +191,10 @@ pub fn listDiscoveredDevices(session_id: u32, timeout_ms: u32) !i32 {
 
     const session = current_session orelse return error.InvalidSessionId;
 
-    var buffer: [2048]u8 = undefined;
+    // Create a properly aligned buffer - mdns requires specific alignment
+    // Use maximum alignment to ensure compatibility with ARM64
+    var buffer_storage: [2048]u8 align(16) = undefined;
+    const buffer = &buffer_storage;
 
     // Calculate end time
     const start_time = std.time.milliTimestamp();
@@ -196,12 +203,16 @@ pub fn listDiscoveredDevices(session_id: u32, timeout_ms: u32) !i32 {
     // Poll for responses within timeout
     var total_responses: usize = 0;
     while (std.time.milliTimestamp() < end_time) {
-        const responses = mdns.mdns_discovery_recv(session.socket, &buffer, buffer.len, discoveryCallback, session);
+        // Pass null as user_data since we're using the global session
+        // Cast buffer to void* to ensure proper handling by C code
+        const buffer_ptr = @as([*]u8, @ptrCast(buffer));
+        // Pass our callback to process discovered devices
+        const responses = mdns.mdns_discovery_recv(session.socket, buffer_ptr, buffer.len, discoveryCallback, null);
         total_responses += responses;
 
         // Small delay to avoid busy waiting - use a simple counter instead of Thread.sleep
         var delay_counter: u32 = 0;
-        while (delay_counter < 1000000000) { // Simple delay loop
+        while (delay_counter < 10000) { // Simple delay loop
             delay_counter += 1;
         }
     }

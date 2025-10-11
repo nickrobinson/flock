@@ -40,8 +40,8 @@ extern "C" {
 #define MDNS_STRING_ARGS(s) s.str, s.length
 #define MDNS_STRING_FORMAT(s) (int)((s).length), s.str
 
-#define MDNS_POINTER_OFFSET(base, offset) ((void*)((uintptr_t)(base) + (offset)))
-#define MDNS_POINTER_OFFSET_CONST(p, ofs) ((const void*)((const char*)(p) + (ptrdiff_t)(ofs)))
+#define MDNS_POINTER_OFFSET(p, ofs) ((void*)((char*)(p) + (ofs)))
+#define MDNS_POINTER_OFFSET_CONST(p, ofs) ((const void*)((const char*)(p) + (ofs)))
 #define MDNS_POINTER_DIFF(a, b) ((size_t)((const char*)(a) - (const char*)(b)))
 
 #define MDNS_PORT 5353
@@ -540,7 +540,8 @@ mdns_get_next_substring(const void* rawdata, size_t size, size_t offset) {
 		if (size < offset + 2)
 			return pair;
 
-		offset = mdns_ntohs(MDNS_POINTER_OFFSET(buffer, offset)) & 0x3fff;
+		uint16_t ptr_value = mdns_ntohs(MDNS_POINTER_OFFSET(buffer, offset));
+		offset = ptr_value & 0x3fff;
 		if (offset >= size)
 			return pair;
 
@@ -783,15 +784,17 @@ mdns_records_parse(int sock, const struct sockaddr* from, size_t addrlen, const 
 		if (((*offset) + 10) > size)
 			return parsed;
 		size_t name_length = (*offset) - name_offset;
-		const uint16_t* data = (const uint16_t*)MDNS_POINTER_OFFSET(buffer, *offset);
+		const uint8_t* data = (const uint8_t*)MDNS_POINTER_OFFSET(buffer, *offset);
 
-		uint16_t rtype = mdns_ntohs(data++);
-		uint16_t rclass = mdns_ntohs(data++);
-		uint32_t ttl = mdns_ntohl(data);
-		data += 2;
-		uint16_t length = mdns_ntohs(data++);
+		uint16_t rtype = mdns_ntohs(data);
+		uint16_t rclass = mdns_ntohs(data + 2);
+		uint32_t ttl = mdns_ntohl(data + 4);
+		uint16_t length = mdns_ntohs(data + 8);
 
 		*offset += 10;
+		
+		// Update data pointer if needed for further use
+		data += 10;
 
 		if (length <= (size - (*offset))) {
 			++parsed;
@@ -891,14 +894,17 @@ mdns_discovery_recv(int sock, void* buffer, size_t capacity, mdns_record_callbac
 
 	size_t data_size = (size_t)ret;
 	size_t records = 0;
-	const uint16_t* data = (uint16_t*)buffer;
+	const uint8_t* data = (const uint8_t*)buffer;
 
-	uint16_t query_id = mdns_ntohs(data++);
-	uint16_t flags = mdns_ntohs(data++);
-	uint16_t questions = mdns_ntohs(data++);
-	uint16_t answer_rrs = mdns_ntohs(data++);
-	uint16_t authority_rrs = mdns_ntohs(data++);
-	uint16_t additional_rrs = mdns_ntohs(data++);
+	uint16_t query_id = mdns_ntohs(data);
+	uint16_t flags = mdns_ntohs(data + 2);
+	uint16_t questions = mdns_ntohs(data + 4);
+	uint16_t answer_rrs = mdns_ntohs(data + 6);
+	uint16_t authority_rrs = mdns_ntohs(data + 8);
+	uint16_t additional_rrs = mdns_ntohs(data + 10);
+	
+	// Move past header (12 bytes)
+	data += 12;
 
 	// According to RFC 6762 the query ID MUST match the sent query ID (which is 0 in our case)
 	if (query_id || (flags != 0x8400))
@@ -917,10 +923,11 @@ mdns_discovery_recv(int sock, void* buffer, size_t capacity, mdns_record_callbac
 		if (!mdns_string_equal(buffer, data_size, &offset, mdns_services_query,
 		                       sizeof(mdns_services_query), &verify_offset))
 			return 0;
-		data = (const uint16_t*)MDNS_POINTER_OFFSET(buffer, offset);
+		data = (const uint8_t*)MDNS_POINTER_OFFSET(buffer, offset);
 
-		uint16_t rtype = mdns_ntohs(data++);
-		uint16_t rclass = mdns_ntohs(data++);
+		uint16_t rtype = mdns_ntohs(data);
+		uint16_t rclass = mdns_ntohs(data + 2);
+		data += 4;
 
 		// Make sure we get a reply based on our PTR question for class IN
 		if ((rtype != MDNS_RECORDTYPE_PTR) || ((rclass & 0x7FFF) != MDNS_CLASS_IN))
@@ -939,13 +946,13 @@ mdns_discovery_recv(int sock, void* buffer, size_t capacity, mdns_record_callbac
 		size_t name_length = offset - name_offset;
 		if ((offset + 10) > data_size)
 			return records;
-		data = (const uint16_t*)MDNS_POINTER_OFFSET(buffer, offset);
+		data = (const uint8_t*)MDNS_POINTER_OFFSET(buffer, offset);
 
-		uint16_t rtype = mdns_ntohs(data++);
-		uint16_t rclass = mdns_ntohs(data++);
-		uint32_t ttl = mdns_ntohl(data);
-		data += 2;
-		uint16_t length = mdns_ntohs(data++);
+		uint16_t rtype = mdns_ntohs(data);
+		uint16_t rclass = mdns_ntohs(data + 2);
+		uint32_t ttl = mdns_ntohl(data + 4);
+		uint16_t length = mdns_ntohs(data + 8);
+		data += 10;
 		if (length > (data_size - offset))
 			return 0;
 
@@ -957,7 +964,7 @@ mdns_discovery_recv(int sock, void* buffer, size_t capacity, mdns_record_callbac
 			             buffer, data_size, name_offset, name_length, offset, length, user_data))
 				return records;
 		}
-		data = (const uint16_t*)MDNS_POINTER_OFFSET_CONST(data, length);
+		data = (const uint8_t*)MDNS_POINTER_OFFSET_CONST(data, length);
 	}
 
 	size_t total_records = records;
@@ -994,14 +1001,17 @@ mdns_socket_listen(int sock, void* buffer, size_t capacity, mdns_record_callback
 		return 0;
 
 	size_t data_size = (size_t)ret;
-	const uint16_t* data = (const uint16_t*)buffer;
+	const uint8_t* data = (const uint8_t*)buffer;
 
-	uint16_t query_id = mdns_ntohs(data++);
-	uint16_t flags = mdns_ntohs(data++);
-	uint16_t questions = mdns_ntohs(data++);
-	uint16_t answer_rrs = mdns_ntohs(data++);
-	uint16_t authority_rrs = mdns_ntohs(data++);
-	uint16_t additional_rrs = mdns_ntohs(data++);
+	uint16_t query_id = mdns_ntohs(data);
+	uint16_t flags = mdns_ntohs(data + 2);
+	uint16_t questions = mdns_ntohs(data + 4);
+	uint16_t answer_rrs = mdns_ntohs(data + 6);
+	uint16_t authority_rrs = mdns_ntohs(data + 8);
+	uint16_t additional_rrs = mdns_ntohs(data + 10);
+	
+	// Move past header (12 bytes)
+	data += 12;
 
 	size_t records;
 	size_t total_records = 0;
@@ -1017,11 +1027,12 @@ mdns_socket_listen(int sock, void* buffer, size_t capacity, mdns_record_callback
 			break;
 		}
 		size_t length = offset - question_offset;
-		data = (const uint16_t*)MDNS_POINTER_OFFSET_CONST(buffer, offset);
+		data = (const uint8_t*)MDNS_POINTER_OFFSET_CONST(buffer, offset);
 
-		uint16_t rtype = mdns_ntohs(data++);
-		uint16_t rclass = mdns_ntohs(data++);
+		uint16_t rtype = mdns_ntohs(data);
+		uint16_t rclass = mdns_ntohs(data + 2);
 		uint16_t class_without_flushbit = rclass & ~MDNS_CACHE_FLUSH;
+		data += 4;
 
 		// Make sure we get a question of class IN or ANY
 		if (!((class_without_flushbit == MDNS_CLASS_IN) ||
@@ -1139,14 +1150,17 @@ mdns_query_recv(int sock, void* buffer, size_t capacity, mdns_record_callback_fn
 		return 0;
 
 	size_t data_size = (size_t)ret;
-	const uint16_t* data = (const uint16_t*)buffer;
+	const uint8_t* data = (const uint8_t*)buffer;
 
-	uint16_t query_id = mdns_ntohs(data++);
-	uint16_t flags = mdns_ntohs(data++);
-	uint16_t questions = mdns_ntohs(data++);
-	uint16_t answer_rrs = mdns_ntohs(data++);
-	uint16_t authority_rrs = mdns_ntohs(data++);
-	uint16_t additional_rrs = mdns_ntohs(data++);
+	uint16_t query_id = mdns_ntohs(data);
+	uint16_t flags = mdns_ntohs(data + 2);
+	uint16_t questions = mdns_ntohs(data + 4);
+	uint16_t answer_rrs = mdns_ntohs(data + 6);
+	uint16_t authority_rrs = mdns_ntohs(data + 8);
+	uint16_t additional_rrs = mdns_ntohs(data + 10);
+	
+	// Move past header (12 bytes)
+	data += 12;
 	(void)sizeof(flags);
 
 	if ((only_query_id > 0) && (query_id != only_query_id))
@@ -1158,11 +1172,11 @@ mdns_query_recv(int sock, void* buffer, size_t capacity, mdns_record_callback_fn
 		size_t offset = MDNS_POINTER_DIFF(data, buffer);
 		if (!mdns_string_skip(buffer, data_size, &offset))
 			return 0;
-		data = (const uint16_t*)MDNS_POINTER_OFFSET_CONST(buffer, offset);
+		data = (const uint8_t*)MDNS_POINTER_OFFSET_CONST(buffer, offset);
 		// Record type and class not used, skip
-		// uint16_t rtype = mdns_ntohs(data++);
-		// uint16_t rclass = mdns_ntohs(data++);
-		data += 2;
+		// uint16_t rtype = mdns_ntohs(data);
+		// uint16_t rclass = mdns_ntohs(data + 2);
+		data += 4;
 	}
 
 	size_t records = 0;
@@ -1522,10 +1536,10 @@ mdns_record_parse_srv(const void* buffer, size_t size, size_t offset, size_t len
 	// 2 bytes network-order unsigned port
 	// string: discovery (domain) name, minimum 2 bytes when compressed
 	if ((size >= offset + length) && (length >= 8)) {
-		const uint16_t* recorddata = (const uint16_t*)MDNS_POINTER_OFFSET_CONST(buffer, offset);
-		srv.priority = mdns_ntohs(recorddata++);
-		srv.weight = mdns_ntohs(recorddata++);
-		srv.port = mdns_ntohs(recorddata++);
+		const uint8_t* recorddata = (const uint8_t*)MDNS_POINTER_OFFSET_CONST(buffer, offset);
+		srv.priority = mdns_ntohs(recorddata);
+		srv.weight = mdns_ntohs(recorddata + 2);
+		srv.port = mdns_ntohs(recorddata + 4);
 		offset += 6;
 		srv.name = mdns_string_extract(buffer, size, &offset, strbuffer, capacity);
 	}

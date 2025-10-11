@@ -60,25 +60,22 @@ export fn Java_com_example_flock_MainActivity_startDiscovery(
     _ = obj;
     _ = service_type_jstring;
 
-    // Use the original simple discovery test instead of complex session management
-    const sock = mdns.openMdnsSocketIpv4(0);
-    if (sock < 0) {
-        return -1; // Failed to open socket
-    }
+    // Clear the cache when starting new discovery
+    device_cache.count = 0;
 
-    // Send discovery query
-    const query_result = mdns.sendMdnsDiscovery(sock);
-    if (query_result < 0) {
-        mdns.closeMdnsSocket(sock);
-        return -2;
-    }
-    
-    // Store socket for later use
-    current_session_id = @intCast(sock);
-    return query_result;
+    const session_id = mdns.startDiscovery(allocator, null) catch |err| {
+        switch (err) {
+            error.SocketOpenFailed => return -1,
+            error.QuerySendFailed => return -2,
+            else => return -3,
+        }
+    };
+
+    current_session_id = session_id;
+    return @intCast(session_id);
 }
 
-// Get discovered devices with timeout - minimal safe version
+// Get discovered devices with timeout - full implementation
 export fn Java_com_example_flock_MainActivity_getDiscoveredDevices(
     env: ?*anyopaque,
     obj: ?*anyopaque,
@@ -86,20 +83,100 @@ export fn Java_com_example_flock_MainActivity_getDiscoveredDevices(
 ) callconv(.c) i32 {
     _ = env;
     _ = obj;
-    _ = timeout_ms;
 
     if (current_session_id == 0) {
         return -1; // No active session
     }
+
+    // Wait for responses and collect discovered devices
+    const device_count = mdns.listDiscoveredDevices(current_session_id, @intCast(timeout_ms)) catch |err| {
+        // Clean up on error
+        mdns.stopDiscovery(current_session_id) catch {};
+        switch (err) {
+            error.InvalidSessionId => return -5,
+        }
+    };
+
+    // Cache the device information before returning
+    device_cache.count = 0;
     
-    // For now, just return 0 to avoid any complex processing that might crash
-    // This should at least let the app run without crashing
-    return 0;
+    const count = @min(@as(usize, @intCast(device_count)), MAX_DEVICES);
+    
+    for (0..count) |i| {
+        // Get and cache name
+        const name = mdns.getDeviceName(current_session_id, i) catch null;
+        if (name) |device_name| {
+            const len = @min(device_name.len, MAX_NAME_LEN - 1);
+            @memcpy(device_cache.names[i][0..len], device_name[0..len]);
+            device_cache.names[i][len] = 0;
+        } else {
+            @memcpy(device_cache.names[i][0..7], "unknown");
+            device_cache.names[i][7] = 0;
+        }
+        
+        // Get and cache IP
+        const ip = mdns.getDeviceIp(current_session_id, i) catch null;
+        if (ip) |device_ip| {
+            const len = @min(device_ip.len, MAX_IP_LEN - 1);
+            @memcpy(device_cache.ips[i][0..len], device_ip[0..len]);
+            device_cache.ips[i][len] = 0;
+        } else {
+            @memcpy(device_cache.ips[i][0..7], "unknown");
+            device_cache.ips[i][7] = 0;
+        }
+        
+        // Get and cache port
+        const port = mdns.getDevicePort(current_session_id, i) catch 0;
+        const port_str = std.fmt.bufPrint(&device_cache.ports[i], "{d}", .{port}) catch "0";
+        device_cache.ports[i][port_str.len] = 0;
+        
+        device_cache.count += 1;
+    }
+
+    return @intCast(device_cache.count);
 }
 
 // Static strings to avoid memory issues
 const static_unknown = "unknown";
 const static_zero = "0";
+
+// Cached device information to prevent use-after-free
+const MAX_DEVICES = 100;
+const MAX_NAME_LEN = 256;
+const MAX_IP_LEN = 46; // IPv6 max length
+
+var device_cache: struct {
+    names: [MAX_DEVICES][MAX_NAME_LEN:0]u8 = undefined,
+    ips: [MAX_DEVICES][MAX_IP_LEN:0]u8 = undefined,
+    ports: [MAX_DEVICES][16:0]u8 = undefined, // Max port string length
+    count: usize = 0,
+} = .{};
+
+// Test function to debug alignment issue
+export fn flock_test_mdns_recv(env: ?*anyopaque, obj: ?*anyopaque) callconv(.c) i32 {
+    _ = env;
+    _ = obj;
+    
+    // Test with a simple aligned buffer
+    var buffer: [2048]u8 align(16) = undefined;
+    
+    // Open a socket
+    const sock = mdns.openMdnsSocketIpv4(0);
+    if (sock < 0) {
+        return -1;
+    }
+    
+    // Try to receive without any callbacks - just test the alignment
+    const mdns_lib = @cImport({
+        @cInclude("mdns.h");
+    });
+    
+    // Try calling mdns_discovery_recv with minimal params
+    _ = mdns_lib.mdns_discovery_recv(sock, &buffer, buffer.len, null, null);
+    
+    mdns.closeMdnsSocket(sock);
+    return 0;
+}
 
 // Get device information by index and type
 export fn Java_com_example_flock_MainActivity_getDeviceInfo(
@@ -111,31 +188,29 @@ export fn Java_com_example_flock_MainActivity_getDeviceInfo(
     _ = env;
     _ = obj;
 
-    if (current_session_id == 0) {
+    if (index < 0 or index >= device_cache.count) {
         return null;
     }
-    
-    if (index < 0) {
-        return null;
-    }
-    
+
+    const idx = @as(usize, @intCast(index));
+
     // Info type constants (from MainActivity):
     // INFO_NAME = 0, INFO_IP = 1, INFO_PORT = 2
     switch (info_type) {
         0 => { // NAME
-            return static_unknown.ptr;
+            return &device_cache.names[idx];
         },
         1 => { // IP
-            return static_unknown.ptr;
+            return &device_cache.ips[idx];
         },
-        2 => { // PORT - return as string for consistency
-            return static_zero.ptr;
+        2 => { // PORT
+            return &device_cache.ports[idx];
         },
         else => return null,
     }
 }
 
-// Stop discovery and clean up - minimal safe version
+// Stop discovery and clean up - full implementation
 export fn Java_com_example_flock_MainActivity_stopDiscovery(
     env: ?*anyopaque,
     obj: ?*anyopaque,
@@ -146,8 +221,15 @@ export fn Java_com_example_flock_MainActivity_stopDiscovery(
     if (current_session_id == 0) {
         return;
     }
-    
-    // Close the socket stored in current_session_id
-    mdns.closeMdnsSocket(@intCast(current_session_id));
+
+    // Stop the discovery session properly
+    mdns.stopDiscovery(current_session_id) catch {
+        // If the mdns cleanup fails, still try to close the socket manually
+        mdns.closeMdnsSocket(@intCast(current_session_id));
+    };
+
     current_session_id = 0;
+    
+    // Clear cache when stopping discovery - this prevents use-after-free
+    device_cache.count = 0;
 }
